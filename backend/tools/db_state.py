@@ -1,0 +1,2245 @@
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional, Set, TypedDict
+
+class CollectionRow(TypedDict, total=False):
+    
+    id: int
+    name: str
+    description: Optional[str]
+    discipline: Optional[str]
+    ga: Optional[str]
+    activity: Optional[str]
+    collection_key: str
+    user_id: Optional[str]
+    team_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    last_refreshed_at: Optional[datetime]
+
+import pandas as pd
+import psycopg2
+from psycopg2.extras import DictCursor
+
+from src.tools.llm_utils import clean_text_for_llm
+
+from config.config import (
+    EMBEDDING_DIM,
+    POSTGRES_DB,
+    POSTGRES_ENABLED,
+    POSTGRES_HOST,
+    POSTGRES_PASSWORD,
+    POSTGRES_PORT,
+    POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS,
+    POSTGRES_TABLE_COLLECTIONS,
+    POSTGRES_TABLE_FEED_STATE,
+    POSTGRES_TABLE_INBOX_ARTICLES,
+    POSTGRES_TABLE_PROCESSED_ARTICLES,
+    POSTGRES_TABLE_RAG_DOCUMENTS,
+    POSTGRES_USER,
+    RSS_FEEDS,
+)
+
+logger = logging.getLogger(__name__)
+
+def get_connection():
+    
+    if not POSTGRES_ENABLED:
+        return None
+
+try:
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            cursor_factory=DictCursor,
+        )
+        conn.autocommit = True
+        return conn
+except Exception as e:
+        logger.warning(f"Не удалось подключиться к PostgreSQL: {e}. Работаем без БД.")
+        return None
+
+def ensure_tables(conn) -> None:
+    
+    if conn is None:
+        return
+
+with conn.cursor() as cur:
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                email         TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_PROCESSED_ARTICLES} (
+                id SERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                link TEXT NOT NULL UNIQUE,
+                published_at TIMESTAMPTZ,
+                processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                title TEXT,
+                summary TEXT
+            );
+            """
+        )
+
+        for col_def in (
+            "title TEXT",
+            "summary TEXT",
+            "feed_id INT REFERENCES feeds(id) ON DELETE SET NULL",
+            "full_text TEXT",
+            "ai_summary TEXT",
+            "full_text_error BOOLEAN DEFAULT FALSE",
+            "rag_indexed_at TIMESTAMPTZ",
+        ):
+            try:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {POSTGRES_TABLE_PROCESSED_ARTICLES}
+                    ADD COLUMN IF NOT EXISTS {col_def};
+                    """
+                )
+except Exception:
+                pass
+
+cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_FEED_STATE} (
+                source TEXT PRIMARY KEY,
+                last_processed_published_at TIMESTAMPTZ
+            );
+            """
+        )
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_COLLECTIONS} (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                discipline TEXT,
+                ga TEXT,
+                activity TEXT,
+                collection_key TEXT NOT NULL,
+                user_id TEXT,
+                team_id TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_refreshed_at TIMESTAMPTZ,
+                UNIQUE (collection_key, name)
+            );
+            """
+        )
+
+        try:
+            cur.execute(
+                f"""
+                ALTER TABLE {POSTGRES_TABLE_COLLECTIONS}
+                ADD COLUMN IF NOT EXISTS description TEXT;
+                """
+            )
+except Exception:
+            pass
+
+try:
+            cur.execute(
+                f"ALTER TABLE {POSTGRES_TABLE_COLLECTIONS} DROP CONSTRAINT IF EXISTS {POSTGRES_TABLE_COLLECTIONS}_collection_key_key;"
+            )
+except Exception:
+            pass
+try:
+            cur.execute(
+                f"""
+                ALTER TABLE {POSTGRES_TABLE_COLLECTIONS}
+                ADD CONSTRAINT {POSTGRES_TABLE_COLLECTIONS}_collection_key_name_key UNIQUE (collection_key, name);
+                """
+            )
+except Exception:
+            pass
+try:
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_collections_user_created
+                ON {POSTGRES_TABLE_COLLECTIONS} (user_id, created_at DESC);
+                """
+            )
+except Exception:
+            pass
+
+try:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+except Exception as e:
+            logger.warning("Расширение pgvector недоступно: %s. Таблица rag_documents не будет создана.", e)
+else:
+
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_RAG_DOCUMENTS} (
+                    id BIGSERIAL PRIMARY KEY,
+                    collection_id INT NOT NULL REFERENCES {POSTGRES_TABLE_COLLECTIONS}(id) ON DELETE CASCADE,
+                    link TEXT NOT NULL,
+                    chunk_index INT NOT NULL DEFAULT 0,
+                    title TEXT,
+                    summary TEXT,
+                    source TEXT,
+                    published_at TIMESTAMPTZ,
+                    discipline TEXT,
+                    ga TEXT,
+                    activity TEXT,
+                    text_payload TEXT NOT NULL,
+                    embedding vector({EMBEDDING_DIM}),
+                    embed_similarity_to_topic REAL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (collection_id, link, chunk_index)
+                );
+                """
+            )
+
+            try:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {POSTGRES_TABLE_RAG_DOCUMENTS}
+                    ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
+                    """
+                )
+except Exception:
+                pass
+
+try:
+                cur.execute(
+                    f"ALTER TABLE {POSTGRES_TABLE_RAG_DOCUMENTS} DROP CONSTRAINT IF EXISTS {POSTGRES_TABLE_RAG_DOCUMENTS}_collection_id_link_key;"
+                )
+except Exception:
+                pass
+try:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {POSTGRES_TABLE_RAG_DOCUMENTS}
+                    DROP CONSTRAINT IF EXISTS {POSTGRES_TABLE_RAG_DOCUMENTS}_collection_id_link_chunk_index_key;
+                    """
+                )
+                cur.execute(
+                    f"""
+                    ALTER TABLE {POSTGRES_TABLE_RAG_DOCUMENTS}
+                    ADD CONSTRAINT {POSTGRES_TABLE_RAG_DOCUMENTS}_collection_id_link_chunk_index_key
+                    UNIQUE (collection_id, link, chunk_index);
+                    """
+                )
+except Exception:
+                pass
+try:
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_rag_documents_collection_published
+                    ON {POSTGRES_TABLE_RAG_DOCUMENTS} (collection_id, published_at DESC);
+                    """
+                )
+except Exception:
+                pass
+try:
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_rag_documents_embedding_hnsw
+                    ON {POSTGRES_TABLE_RAG_DOCUMENTS} USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 16, ef_construction = 64);
+                    """
+                )
+except Exception:
+                pass
+try:
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_rag_documents_collection_id
+                    ON {POSTGRES_TABLE_RAG_DOCUMENTS} (collection_id);
+                    """
+                )
+except Exception:
+                pass
+
+for col_def in ("bertopic_topic_id INT", "model_version TEXT", "keywords TEXT"):
+            try:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {POSTGRES_TABLE_COLLECTIONS}
+                    ADD COLUMN IF NOT EXISTS {col_def};
+                    """
+                )
+except Exception:
+                pass
+
+cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS} (
+                link          TEXT NOT NULL,
+                topic_id      INT  NOT NULL,
+                probability   FLOAT,
+                assigned_at   TIMESTAMPTZ DEFAULT NOW(),
+                model_version TEXT,
+                PRIMARY KEY (link, topic_id)
+            );
+            """
+        )
+
+        try:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_INBOX_ARTICLES} (
+                    link        TEXT PRIMARY KEY,
+                    title       TEXT,
+                    source      TEXT,
+                    embedding   VECTOR({EMBEDDING_DIM}),
+                    received_at TIMESTAMPTZ DEFAULT NOW(),
+                    checked_at  TIMESTAMPTZ
+                );
+                """
+            )
+except Exception as e:
+            logger.warning("Таблица inbox_articles не создана (pgvector?): %s", e)
+
+cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feeds (
+                id              SERIAL PRIMARY KEY,
+                url             TEXT NOT NULL UNIQUE,
+                name            TEXT NOT NULL,
+                favicon_url     TEXT,
+                category        TEXT,
+                is_catalog      BOOLEAN DEFAULT FALSE,
+                enabled         BOOLEAN DEFAULT TRUE,
+                last_fetched_at TIMESTAMPTZ,
+                last_error      TEXT,
+                error_count     INT DEFAULT 0
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE feeds ADD COLUMN IF NOT EXISTS category TEXT;
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_feeds (
+                feed_id    INT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+                user_id    INT,
+                folder_id  INT,
+                position   INT DEFAULT 0,
+                hidden     BOOLEAN DEFAULT FALSE,
+                PRIMARY KEY (feed_id, user_id)
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feed_folders (
+                id        SERIAL PRIMARY KEY,
+                user_id   INT,
+                name      TEXT NOT NULL,
+                position  INT DEFAULT 0
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE user_feeds ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT FALSE;
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE feed_folders ADD COLUMN IF NOT EXISTS favicon_url TEXT;
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE feeds ADD COLUMN IF NOT EXISTS description TEXT;
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE user_feeds ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS article_reads (
+                link     TEXT NOT NULL,
+                user_id  INT  NOT NULL DEFAULT 0,
+                read_at  TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (link, user_id)
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS article_bookmarks (
+                link     TEXT        NOT NULL,
+                user_id  INT         NOT NULL DEFAULT 0,
+                saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (link, user_id)
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feed_catalog_stats (
+                feed_id        INT PRIMARY KEY REFERENCES feeds(id) ON DELETE CASCADE,
+                subscribers    INT DEFAULT 0,
+                posts_per_week INT DEFAULT 0,
+                last_post_at   TIMESTAMPTZ,
+                updated_at     TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            f"""
+            ALTER TABLE {POSTGRES_TABLE_COLLECTIONS}
+                ADD COLUMN IF NOT EXISTS owner_id INT;
+            ALTER TABLE {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}
+                ADD COLUMN IF NOT EXISTS owner_id INT;
+            """
+        )
+
+        cur.execute(
+            f"DELETE FROM {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS} WHERE owner_id IS NULL;"
+        )
+
+        cur.execute(
+            f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.key_column_usage
+                    WHERE table_name = '{POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}'
+                      AND constraint_name = '{POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}_pkey'
+                      AND column_name = 'owner_id'
+                ) THEN
+                    ALTER TABLE {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}
+                        DROP CONSTRAINT IF EXISTS {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}_pkey;
+                    ALTER TABLE {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}
+                        ADD PRIMARY KEY (link, topic_id, owner_id);
+                END IF;
+            END$$;
+            """
+        )
+
+def build_collection_key(selection: Dict[str, Optional[str]]) -> str:
+    
+    d = (selection.get("discipline") or "").strip()
+    g = (selection.get("ga") or "").strip()
+    a = (selection.get("activity") or "").strip()
+    parts = [d] if d else []
+    if g:
+        parts.append(g)
+if a:
+        parts.append(a)
+return ".".join(parts) if parts else ""
+
+def get_or_create_collection(
+    conn,
+    selection: Dict[str, Optional[str]],
+    taxonomy: Dict,
+    user_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    collection_name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Optional[CollectionRow]:
+    
+    if conn is None:
+        return None
+key = build_collection_key(selection)
+    if not key:
+        return None
+
+if collection_name and collection_name.strip():
+        name = collection_name.strip()
+else:
+        from src.pipeline.taxonomy import get_collection_display_name
+        name = get_collection_display_name(taxonomy, selection)
+discipline = selection.get("discipline")
+    ga = selection.get("ga")
+    activity = selection.get("activity")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, name, description, discipline, ga, activity, collection_key, user_id, team_id,
+                   created_at, updated_at, last_refreshed_at
+            FROM {POSTGRES_TABLE_COLLECTIONS}
+            WHERE collection_key = %s AND name = %s;
+            """,
+            (key, name),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                f"""
+                UPDATE {POSTGRES_TABLE_COLLECTIONS}
+                SET last_refreshed_at = NOW(), updated_at = NOW(),
+                    description = COALESCE(%s, description)
+                WHERE id = %s
+                RETURNING id, name, description, discipline, ga, activity, collection_key, user_id, team_id,
+                          created_at, updated_at, last_refreshed_at;
+                """,
+                (description, row["id"]),
+            )
+            row = cur.fetchone()
+else:
+            cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_COLLECTIONS}
+                    (name, description, discipline, ga, activity, collection_key, user_id, team_id, updated_at, last_refreshed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id, name, description, discipline, ga, activity, collection_key, user_id, team_id,
+                          created_at, updated_at, last_refreshed_at;
+                """,
+                (name, description, discipline, ga, activity, key, user_id, team_id),
+            )
+            row = cur.fetchone()
+if not row:
+        return None
+return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "discipline": row["discipline"],
+        "ga": row["ga"],
+        "activity": row["activity"],
+        "collection_key": row["collection_key"],
+        "user_id": row["user_id"],
+        "team_id": row["team_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_refreshed_at": row["last_refreshed_at"],
+    }
+
+def update_collection_last_refreshed(conn, collection_id: int) -> None:
+    
+    if conn is None or collection_id is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {POSTGRES_TABLE_COLLECTIONS}
+            SET last_refreshed_at = NOW(), updated_at = NOW()
+            WHERE id = %s;
+            """,
+            (collection_id,),
+        )
+
+def list_collections(conn, owner_id: Optional[int] = None) -> List[CollectionRow]:
+    
+    if conn is None:
+        return []
+owner_filter = "WHERE c.owner_id = %s" if owner_id is not None else ""
+    params = (owner_id,) if owner_id is not None else ()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT c.id, c.name, c.description, c.discipline, c.ga, c.activity,
+                   c.collection_key, c.user_id, c.team_id, c.owner_id,
+                   c.created_at, c.updated_at, c.last_refreshed_at,
+                   COUNT(DISTINCT r.link) AS article_count
+            FROM {POSTGRES_TABLE_COLLECTIONS} c
+            LEFT JOIN {POSTGRES_TABLE_RAG_DOCUMENTS} r ON r.collection_id = c.id
+            {owner_filter}
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC NULLS LAST, c.id DESC;
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+return [dict(row) for row in rows]
+
+def get_collection_by_id(conn, collection_id: int, owner_id: Optional[int] = None) -> Optional[CollectionRow]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        if owner_id is not None:
+            cur.execute(
+                f"""
+                SELECT id, name, description, discipline, ga, activity, collection_key, user_id, team_id,
+                       owner_id, created_at, updated_at, last_refreshed_at
+                FROM {POSTGRES_TABLE_COLLECTIONS}
+                WHERE id = %s AND owner_id = %s;
+                """,
+                (collection_id, owner_id),
+            )
+else:
+            cur.execute(
+                f"""
+                SELECT id, name, description, discipline, ga, activity, collection_key, user_id, team_id,
+                       owner_id, created_at, updated_at, last_refreshed_at
+                FROM {POSTGRES_TABLE_COLLECTIONS}
+                WHERE id = %s;
+                """,
+                (collection_id,),
+            )
+row = cur.fetchone()
+return dict(row) if row else None
+
+def get_articles_for_collection(
+    conn,
+    collection_id: int,
+) -> List[Dict]:
+    
+    if conn is None:
+        return []
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (link) link, title, summary, source, published_at
+            FROM {POSTGRES_TABLE_RAG_DOCUMENTS}
+            WHERE collection_id = %s
+            ORDER BY link, chunk_index;
+            """,
+            (collection_id,),
+        )
+        rows = cur.fetchall()
+return [dict(row) for row in rows]
+
+def _embedding_to_vector_str(embedding: List[float]) -> str:
+    
+    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+def delete_rag_documents_by_links(conn, collection_id: int, links: Iterable[str]) -> None:
+    
+    if conn is None or not links:
+        return
+links_list = list(links)
+    if not links_list:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            DELETE FROM {POSTGRES_TABLE_RAG_DOCUMENTS}
+            WHERE collection_id = %s AND link = ANY(%s);
+            """,
+            (collection_id, links_list),
+        )
+
+def upsert_rag_documents(
+    conn,
+    collection_id: int,
+    discipline: Optional[str],
+    ga: Optional[str],
+    activity: Optional[str],
+    documents: List[Dict],
+) -> int:
+    
+    if conn is None or not documents:
+        return 0
+count = 0
+    with conn.cursor() as cur:
+        for doc in documents:
+            link = doc.get("link")
+            if not link:
+                continue
+chunk_index = int(doc.get("chunk_index", 0))
+            title = doc.get("title") or ""
+            summary = doc.get("summary") or ""
+            source = doc.get("source") or ""
+            published_at = doc.get("published_at")
+            try:
+                import pandas as pd
+                if pd.isnull(published_at):
+                    published_at = None
+except (TypeError, ValueError, ImportError):
+                pass
+text_payload = doc.get("text_payload") or ""
+            embedding = doc.get("embedding")
+            embed_sim = doc.get("embed_similarity_to_topic")
+            if embedding is not None:
+                emb_str = _embedding_to_vector_str(embedding)
+else:
+                emb_str = None
+cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_RAG_DOCUMENTS}
+                    (collection_id, link, chunk_index, title, summary, source, published_at,
+                     discipline, ga, activity, text_payload, embedding, embed_similarity_to_topic, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, NOW())
+                ON CONFLICT (collection_id, link, chunk_index) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    summary = EXCLUDED.summary,
+                    source = EXCLUDED.source,
+                    published_at = EXCLUDED.published_at,
+                    discipline = EXCLUDED.discipline,
+                    ga = EXCLUDED.ga,
+                    activity = EXCLUDED.activity,
+                    text_payload = EXCLUDED.text_payload,
+                    embedding = EXCLUDED.embedding,
+                    embed_similarity_to_topic = EXCLUDED.embed_similarity_to_topic,
+                    updated_at = NOW();
+                """,
+                (
+                    collection_id,
+                    link,
+                    chunk_index,
+                    title,
+                    summary,
+                    source,
+                    published_at,
+                    discipline,
+                    ga,
+                    activity,
+                    text_payload,
+                    emb_str,
+                    embed_sim,
+                ),
+            )
+            count += 1
+return count
+
+def load_processed_links(conn) -> Set[str]:
+    
+    if conn is None:
+        return set()
+
+with conn.cursor() as cur:
+        cur.execute(f"SELECT link FROM {POSTGRES_TABLE_PROCESSED_ARTICLES};")
+        rows = cur.fetchall()
+        return {row["link"] for row in rows if row.get("link")}
+
+def get_existing_links(conn, candidate_links: List[str]) -> Set[str]:
+    
+    if not candidate_links or conn is None:
+        return set()
+
+with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT link FROM {POSTGRES_TABLE_PROCESSED_ARTICLES} WHERE link = ANY(%s)",
+            (candidate_links,),
+        )
+        return {row["link"] for row in cur.fetchall()}
+
+def load_articles_for_window(conn, hours_back: int):
+    
+    if conn is None:
+        return pd.DataFrame()
+
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT source, link, published_at, title, summary
+            FROM {POSTGRES_TABLE_PROCESSED_ARTICLES}
+            WHERE published_at >= NOW() - INTERVAL '1 hour' * %s
+            ORDER BY published_at DESC;
+            """,
+            (hours_back,),
+        )
+        rows = cur.fetchall()
+
+if not rows:
+        return pd.DataFrame()
+
+records = []
+    for row in rows:
+        published_at = row.get("published_at")
+        records.append({
+            "source": row.get("source"),
+            "link": row.get("link") or "",
+            "published": published_at.strftime("%Y-%m-%d %H:%M:%S") if published_at else "—",
+            "summary": row.get("summary") or "Без описания",
+            "title": row.get("title") or "",
+            "published_dt": published_at,
+        })
+return pd.DataFrame(records)
+
+def delete_bertopic_collections(conn, owner_id: Optional[int] = None) -> int:
+    
+    if conn is None:
+        return 0
+with conn.cursor() as cur:
+        if owner_id is not None:
+            cur.execute(
+                f"DELETE FROM {POSTGRES_TABLE_COLLECTIONS} WHERE bertopic_topic_id IS NOT NULL AND owner_id = %s;",
+                (owner_id,),
+            )
+else:
+            cur.execute(
+                f"DELETE FROM {POSTGRES_TABLE_COLLECTIONS} WHERE bertopic_topic_id IS NOT NULL;"
+            )
+return cur.rowcount
+
+def delete_bertopic_assignments(conn, owner_id: Optional[int] = None) -> int:
+    
+    if conn is None:
+        return 0
+with conn.cursor() as cur:
+        if owner_id is not None:
+            cur.execute(
+                f"DELETE FROM {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS} WHERE owner_id = %s;",
+                (owner_id,),
+            )
+else:
+            cur.execute(f"DELETE FROM {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS};")
+return cur.rowcount
+
+def create_bertopic_collection(
+    conn,
+    topic_id: int,
+    topic_name: str,
+    model_version: str,
+    description: Optional[str] = None,
+    keywords: Optional[str] = None,
+    owner_id: Optional[int] = None,
+) -> Optional[CollectionRow]:
+    
+    if conn is None:
+        return None
+key = f"bertopic_topic_{topic_id}"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {POSTGRES_TABLE_COLLECTIONS}
+                (name, description, keywords, discipline, ga, activity, collection_key,
+                 bertopic_topic_id, model_version, owner_id, updated_at, last_refreshed_at)
+            VALUES (%s, %s, %s, NULL, NULL, NULL, %s, %s, %s, %s, NOW(), NOW())
+            RETURNING id, name, description, keywords, discipline, ga, activity, collection_key,
+                      user_id, team_id, owner_id, created_at, updated_at, last_refreshed_at;
+            """,
+            (topic_name, description, keywords, key, topic_id, model_version, owner_id),
+        )
+        row = cur.fetchone()
+if not row:
+        return None
+return dict(row)
+
+def upsert_bertopic_assignments(
+    conn,
+    assignments: List[Dict],
+    model_version: str,
+    owner_id: Optional[int] = None,
+) -> int:
+    
+    if conn is None or not assignments:
+        return 0
+count = 0
+    with conn.cursor() as cur:
+        for a in assignments:
+            link = a.get("link")
+            topic_id = a.get("topic_id")
+            if not link or topic_id is None:
+                continue
+cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS}
+                    (link, topic_id, probability, model_version, owner_id, assigned_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (link, topic_id, owner_id) DO UPDATE SET
+                    probability   = EXCLUDED.probability,
+                    model_version = EXCLUDED.model_version,
+                    assigned_at   = NOW();
+                """,
+                (link, topic_id, a.get("probability"), model_version, owner_id),
+            )
+            count += 1
+return count
+
+def add_to_inbox(
+    conn,
+    articles: List[Dict],
+) -> int:
+    
+    if conn is None or not articles:
+        return 0
+count = 0
+    with conn.cursor() as cur:
+        for art in articles:
+            link = art.get("link")
+            if not link:
+                continue
+embedding = art.get("embedding")
+            emb_str = _embedding_to_vector_str(embedding) if embedding else None
+            cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_INBOX_ARTICLES}
+                    (link, title, source, embedding, received_at)
+                VALUES (%s, %s, %s, %s::vector, NOW())
+                ON CONFLICT (link) DO NOTHING;
+                """,
+                (link, art.get("title") or "", art.get("source") or "", emb_str),
+            )
+            count += 1
+return count
+
+def update_feed_states_from_seen(conn, per_feed_max: Dict[str, datetime]) -> None:
+    
+    if conn is None or not per_feed_max:
+        return
+
+with conn.cursor() as cur:
+        for source, max_dt in per_feed_max.items():
+            if not source or not isinstance(max_dt, datetime):
+                continue
+cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_FEED_STATE} (source, last_processed_published_at)
+                VALUES (%s, %s)
+                ON CONFLICT (source)
+                DO UPDATE SET last_processed_published_at = GREATEST(
+                    EXCLUDED.last_processed_published_at,
+                    {POSTGRES_TABLE_FEED_STATE}.last_processed_published_at
+                );
+                """,
+                (source, max_dt),
+            )
+
+def create_feed(conn, url: str, name: str, favicon_url: Optional[str] = None, category: Optional[str] = None, description: Optional[str] = None, folder_id: Optional[int] = None, user_id: Optional[int] = None) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+_user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO feeds (url, name, favicon_url, category, description)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO NOTHING
+            RETURNING id, url, name, favicon_url, category, description, enabled, error_count, last_fetched_at;
+            """,
+            (url, name, favicon_url, category, description),
+        )
+        feed_row = cur.fetchone()
+        if feed_row is None:
+            cur.execute(
+                "SELECT id, url, name, favicon_url, category, description, enabled, error_count, last_fetched_at FROM feeds WHERE url = %s;",
+                (url,),
+            )
+            feed_row = cur.fetchone()
+feed = dict(feed_row)
+        cur.execute(
+            """
+            INSERT INTO user_feeds (feed_id, user_id, folder_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (feed_id, user_id) DO NOTHING;
+            """,
+            (feed["id"], _user_id, folder_id),
+        )
+        return feed
+
+def list_feeds(conn, user_id: Optional[int] = None, include_hidden: bool = False) -> List[dict]:
+    
+    if conn is None:
+        return []
+_user_id = user_id if user_id is not None else 0
+
+    hidden_where = "" if include_hidden else "WHERE uf.hidden = FALSE"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                   f.error_count, f.last_fetched_at, f.last_error,
+                   uf.folder_id, uf.position, uf.hidden, uf.created_at,
+                   COUNT(pa.link) FILTER (
+                       WHERE pa.link IS NOT NULL
+                         AND ar.link IS NULL
+                   ) AS unread_count
+            FROM feeds f
+            JOIN user_feeds uf ON uf.feed_id = f.id AND uf.user_id = %s
+            LEFT JOIN processed_articles pa ON pa.feed_id = f.id
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            {hidden_where}
+            GROUP BY f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                     f.error_count, f.last_fetched_at, f.last_error,
+                     uf.folder_id, uf.position, uf.hidden, uf.created_at
+            ORDER BY uf.position ASC, f.name ASC;
+            """,
+            (_user_id, _user_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+def get_user_feed_by_id(conn, feed_id: int, user_id: Optional[int] = None) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+_user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                   f.error_count, f.last_fetched_at, f.last_error,
+                   uf.folder_id, uf.position, uf.hidden, uf.created_at,
+                   COUNT(pa.link) FILTER (
+                       WHERE pa.link IS NOT NULL
+                         AND ar.link IS NULL
+                   ) AS unread_count
+            FROM feeds f
+            JOIN user_feeds uf ON uf.feed_id = f.id AND uf.user_id = %s
+            LEFT JOIN processed_articles pa ON pa.feed_id = f.id
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            WHERE f.id = %s
+            GROUP BY f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                     f.error_count, f.last_fetched_at, f.last_error,
+                     uf.folder_id, uf.position, uf.hidden, uf.created_at;
+            """,
+            (_user_id, _user_id, feed_id),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def get_feed_by_id(conn, feed_id: int) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute("SELECT id, url, name, enabled FROM feeds WHERE id = %s;", (feed_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def delete_feed(conn, feed_id: int, user_id: Optional[int] = None) -> bool:
+    
+    if conn is None:
+        return False
+_user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM user_feeds
+            WHERE feed_id = %s AND user_id = %s;
+            """,
+            (feed_id, _user_id),
+        )
+        return cur.rowcount > 0
+
+def update_feed(conn, feed_id: int, user_id: Optional[int] = None, **kwargs) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+_user_id = user_id if user_id is not None else 0
+    allowed = {"folder_id", "position", "hidden"}
+    feed_allowed = {"name", "enabled"}
+    user_updates = {k: v for k, v in kwargs.items() if k in allowed}
+    feed_updates = {k: v for k, v in kwargs.items() if k in feed_allowed}
+
+    with conn.cursor() as cur:
+        if feed_updates:
+            set_clause = ", ".join(f"{k} = %s" for k in feed_updates)
+            cur.execute(
+                f"UPDATE feeds SET {set_clause} WHERE id = %s"
+                f" AND id IN (SELECT feed_id FROM user_feeds WHERE user_id = %s);",
+                list(feed_updates.values()) + [feed_id, _user_id],
+            )
+if user_updates:
+            set_clause = ", ".join(f"{k} = %s" for k in user_updates)
+            cur.execute(
+                f"UPDATE user_feeds SET {set_clause} WHERE feed_id = %s AND user_id = %s;",
+                list(user_updates.values()) + [feed_id, _user_id],
+            )
+cur.execute(
+            """
+            SELECT f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                   f.error_count, f.last_fetched_at, f.last_error,
+                   uf.folder_id, uf.position, uf.hidden, uf.created_at,
+                   COUNT(pa.link) FILTER (
+                       WHERE pa.link IS NOT NULL AND ar.link IS NULL
+                   ) AS unread_count
+            FROM feeds f
+            JOIN user_feeds uf ON uf.feed_id = f.id
+            LEFT JOIN processed_articles pa ON pa.feed_id = f.id
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            WHERE f.id = %s AND uf.user_id = %s
+            GROUP BY f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                     f.error_count, f.last_fetched_at, f.last_error,
+                     uf.folder_id, uf.position, uf.hidden, uf.created_at;
+            """,
+            (_user_id, feed_id, _user_id),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def update_feed_status(conn, url: str, error: Optional[str] = None) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        if error is None:
+            cur.execute(
+                """
+                UPDATE feeds SET error_count = 0, last_error = NULL, last_fetched_at = NOW()
+                WHERE url = %s;
+                """,
+                (url,),
+            )
+else:
+            cur.execute(
+                """
+                UPDATE feeds SET error_count = error_count + 1, last_error = %s
+                WHERE url = %s;
+                """,
+                (error, url),
+            )
+
+def get_feeds_as_dict(conn) -> dict:
+    
+    if conn is None:
+        return {}
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT f.name, f.url
+            FROM feeds f
+            WHERE f.enabled = TRUE;
+            """
+        )
+        rows = cur.fetchall()
+        return {r["name"]: r["url"] for r in rows}
+
+def load_feed_url_id_map(conn) -> Dict[str, int]:
+    
+    if conn is None:
+        return {}
+with conn.cursor() as cur:
+        cur.execute("SELECT id, url FROM feeds;")
+        return {row["url"]: row["id"] for row in cur.fetchall()}
+
+def load_feed_states(conn) -> Dict[str, datetime]:
+    
+    if conn is None:
+        return {}
+
+with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT source, last_processed_published_at FROM {POSTGRES_TABLE_FEED_STATE};"
+        )
+        rows = cur.fetchall()
+        result = {}
+        for row in rows:
+            source = row.get("source")
+            last_dt = row.get("last_processed_published_at")
+            if source and isinstance(last_dt, datetime):
+                result[source] = last_dt
+return result
+
+def update_state_with_articles(conn, articles: Iterable[Dict]) -> None:
+    
+    if conn is None:
+        return
+
+articles = list(articles)
+    if not articles:
+        return
+
+with conn.cursor() as cur:
+
+        for art in articles:
+            source = art.get("source")
+            link = art.get("link")
+            published_dt = art.get("published_dt")
+            title = art.get("title") or ""
+            raw_summary = art.get("summary") or ""
+
+            summary = clean_text_for_llm(raw_summary, max_chars=None) if raw_summary else ""
+
+            if not link or not source:
+                continue
+
+feed_id = art.get("feed_id")
+
+            cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_PROCESSED_ARTICLES} (source, link, published_at, title, summary, feed_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (link) DO UPDATE SET
+                    title   = EXCLUDED.title,
+                    summary = EXCLUDED.summary,
+                    published_at = COALESCE(EXCLUDED.published_at, {POSTGRES_TABLE_PROCESSED_ARTICLES}.published_at),
+                    feed_id = COALESCE(EXCLUDED.feed_id, {POSTGRES_TABLE_PROCESSED_ARTICLES}.feed_id);
+                """,
+                (source, link, published_dt, title, summary, feed_id),
+            )
+
+per_source_max: Dict[str, datetime] = {}
+        for art in articles:
+            source = art.get("source")
+            published_dt = art.get("published_dt")
+            if not source or not isinstance(published_dt, datetime):
+                continue
+current_max = per_source_max.get(source)
+            if current_max is None or published_dt > current_max:
+                per_source_max[source] = published_dt
+
+for source, max_dt in per_source_max.items():
+            cur.execute(
+                f"""
+                INSERT INTO {POSTGRES_TABLE_FEED_STATE} (source, last_processed_published_at)
+                VALUES (%s, %s)
+                ON CONFLICT (source)
+                DO UPDATE SET last_processed_published_at = GREATEST(
+                    EXCLUDED.last_processed_published_at,
+                    {POSTGRES_TABLE_FEED_STATE}.last_processed_published_at
+                );
+                """,
+                (source, max_dt),
+            )
+
+def import_catalog_feeds(conn) -> int:
+    
+    if conn is None:
+        return 0
+from urllib.parse import urlparse
+    count = 0
+    with conn.cursor() as cur:
+        for name, feed in RSS_FEEDS.items():
+            url = feed["url"] if isinstance(feed, dict) else feed
+            category = feed.get("category") if isinstance(feed, dict) else None
+            if not url:
+                continue
+domain = urlparse(url).netloc
+            favicon_url = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+            cur.execute(
+                """
+                INSERT INTO feeds (url, name, favicon_url, category, is_catalog, enabled)
+                VALUES (%s, %s, %s, %s, TRUE, TRUE)
+                ON CONFLICT (url) DO UPDATE SET
+                    is_catalog = TRUE,
+                    name       = EXCLUDED.name,
+                    category   = COALESCE(EXCLUDED.category, feeds.category)
+                RETURNING (xmax = 0) AS inserted;
+                """,
+                (url, name, favicon_url, category),
+            )
+            row = cur.fetchone()
+            if row and row["inserted"]:
+                count += 1
+
+config_urls = [
+            (feed["url"] if isinstance(feed, dict) else feed)
+            for feed in RSS_FEEDS.values()
+        ]
+        if config_urls:
+            cur.execute(
+                """
+                UPDATE feeds SET is_catalog = FALSE
+                WHERE is_catalog = TRUE AND url != ALL(%s::text[]);
+                """,
+                (config_urls,),
+            )
+            removed = cur.rowcount
+            if removed:
+                logger.info("import_catalog_feeds: убрано %d лент из каталога (нет в конфиге)", removed)
+
+conn.commit()
+    logger.info("import_catalog_feeds: добавлено %d новых лент в каталог", count)
+    return count
+
+def refresh_catalog_stats(conn) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM feeds WHERE is_catalog = TRUE;")
+        feeds = cur.fetchall()
+
+        for feed in feeds:
+            feed_id = feed["id"]
+            feed_name = feed["name"]
+
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM user_feeds WHERE feed_id = %s;",
+                (feed_id,),
+            )
+            subscribers = cur.fetchone()["cnt"]
+
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE published_at > NOW() - INTERVAL '7 days')
+                        AS posts_per_week,
+                    MAX(published_at) AS last_post_at
+                FROM {POSTGRES_TABLE_PROCESSED_ARTICLES}
+                WHERE feed_id = %s
+                   OR (feed_id IS NULL AND source = %s);
+                """,
+                (feed_id, feed_name),
+            )
+            stats = cur.fetchone()
+            posts_per_week = int(stats["posts_per_week"] or 0)
+            last_post_at = stats["last_post_at"]
+
+            cur.execute(
+                """
+                INSERT INTO feed_catalog_stats
+                    (feed_id, subscribers, posts_per_week, last_post_at, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (feed_id) DO UPDATE SET
+                    subscribers    = EXCLUDED.subscribers,
+                    posts_per_week = EXCLUDED.posts_per_week,
+                    last_post_at   = EXCLUDED.last_post_at,
+                    updated_at     = NOW();
+                """,
+                (feed_id, subscribers, posts_per_week, last_post_at),
+            )
+conn.commit()
+    logger.info("refresh_catalog_stats: статистика обновлена для %d лент", len(feeds))
+
+def list_catalog_feeds(conn, user_id=None):
+    
+    if conn is None:
+        return []
+_user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                f.id, f.url, f.name, f.favicon_url, f.description, f.category, f.enabled,
+                f.error_count, f.last_fetched_at,
+                COALESCE(s.subscribers, 0)    AS subscribers,
+                COALESCE(s.posts_per_week, 0) AS posts_per_week,
+                s.last_post_at,
+                CASE WHEN uf.feed_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_subscribed
+            FROM feeds f
+            LEFT JOIN feed_catalog_stats s ON s.feed_id = f.id
+            LEFT JOIN user_feeds uf
+                ON uf.feed_id = f.id
+               AND uf.user_id = %s
+            WHERE f.is_catalog = TRUE
+            ORDER BY f.name;
+            """,
+            (_user_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def update_feed_descriptions(conn, feed_descriptions: dict) -> None:
+    
+    if not feed_descriptions or conn is None:
+        return
+with conn.cursor() as cur:
+        for url, description in feed_descriptions.items():
+            cur.execute(
+                "UPDATE feeds SET description = %s WHERE url = %s AND description IS NULL;",
+                (description, url),
+            )
+conn.commit()
+    logger.info("update_feed_descriptions: обновлено %d описаний лент", len(feed_descriptions))
+
+def create_folder(conn, name: str, favicon_url: Optional[str] = None, user_id: Optional[int] = None) -> dict:
+    
+    _user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO feed_folders (user_id, name, favicon_url)
+            VALUES (%s, %s, %s)
+            RETURNING id, user_id, name, position, favicon_url;
+            """,
+            (_user_id, name, favicon_url),
+        )
+        return dict(cur.fetchone())
+
+def list_folders(conn, user_id: Optional[int] = None) -> List[dict]:
+    
+    _user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, user_id, name, position, favicon_url
+            FROM feed_folders
+            WHERE user_id = %s
+            ORDER BY position ASC, name ASC;
+            """,
+            (_user_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def update_folder(conn, folder_id: int, user_id: Optional[int] = None, **kwargs) -> Optional[dict]:
+    
+    _user_id = user_id if user_id is not None else 0
+    allowed = {"name", "position"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed}
+    if not updates:
+        return None
+with conn.cursor() as cur:
+        set_clause = ", ".join(f"{k} = %s" for k in updates)
+        cur.execute(
+            f"""
+            UPDATE feed_folders SET {set_clause}
+            WHERE id = %s AND user_id = %s
+            RETURNING id, user_id, name, position;
+            """,
+            list(updates.values()) + [folder_id, _user_id],
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def delete_folder(conn, folder_id: int, user_id: Optional[int] = None) -> bool:
+    
+    _user_id = user_id if user_id is not None else 0
+    with conn.cursor() as cur:
+
+        cur.execute(
+            "UPDATE user_feeds SET folder_id = NULL WHERE folder_id = %s AND user_id = %s;",
+            (folder_id, _user_id),
+        )
+        cur.execute(
+            "DELETE FROM feed_folders WHERE id = %s AND user_id = %s;",
+            (folder_id, _user_id),
+        )
+        return cur.rowcount > 0
+
+def list_all_articles(
+    conn, user_id: int = 0, page: int = 1, page_size: int = 30
+) -> List[dict]:
+    
+    if conn is None:
+        return []
+offset = (page - 1) * page_size
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            WHERE uf.hidden = FALSE
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s OFFSET %s;
+            """,
+            (user_id, user_id, user_id, page_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def list_feed_articles(
+    conn,
+    feed_id: int,
+    page: int = 1,
+    page_size: int = 30,
+    user_id: int = 0,
+    unread_only: bool = False,
+) -> List[dict]:
+    
+    if conn is None:
+        return []
+offset = (page - 1) * page_size
+    unread_filter = "AND ar.link IS NULL" if unread_only else ""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            LEFT JOIN article_reads ar
+                ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab
+                ON ab.link = pa.link AND ab.user_id = %s
+            WHERE pa.feed_id = %s
+            {unread_filter}
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s OFFSET %s;
+            """,
+            (user_id, user_id, feed_id, page_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def list_articles_by_feed_ids(
+    conn,
+    feed_ids: List[int],
+    page: int = 1,
+    page_size: int = 30,
+    user_id: int = 0,
+) -> List[dict]:
+    
+    if conn is None or not feed_ids:
+        return []
+offset = (page - 1) * page_size
+    placeholders = ",".join(["%s"] * len(feed_ids))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            LEFT JOIN article_reads ar
+                ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab
+                ON ab.link = pa.link AND ab.user_id = %s
+            WHERE pa.feed_id IN ({placeholders})
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s OFFSET %s;
+            """,
+            (user_id, user_id, *feed_ids, page_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def get_article_by_id(conn, article_id: int, user_id: int = 0) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.full_text,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            LEFT JOIN article_reads ar
+                ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab
+                ON ab.link = pa.link AND ab.user_id = %s
+            WHERE pa.id = %s;
+            """,
+            (user_id, user_id, article_id),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def update_article_full_text(conn, article_id: int, full_text: str) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE processed_articles SET full_text = %s, rag_indexed_at = NULL WHERE id = %s;",
+            (full_text, article_id),
+        )
+
+def get_article_for_summarize(conn, article_id: int) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, link, title, full_text, summary, ai_summary
+            FROM processed_articles
+            WHERE id = %s;
+            """,
+            (article_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def save_ai_summary(conn, article_id: int, ai_summary: str) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE processed_articles SET ai_summary = %s WHERE id = %s;",
+            (ai_summary, article_id),
+        )
+
+def get_articles_without_fulltext(conn, limit: int = 100) -> list:
+    
+    if conn is None:
+        return []
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, link, title, ai_summary
+            FROM processed_articles
+            WHERE full_text IS NULL AND full_text_error = FALSE
+            ORDER BY published_at DESC
+            LIMIT %s;
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def get_articles_without_summary(conn, limit: int = 100) -> list:
+    
+    if conn is None:
+        return []
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, title, full_text
+            FROM processed_articles
+            WHERE full_text IS NOT NULL AND ai_summary IS NULL
+            ORDER BY published_at DESC
+            LIMIT %s;
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def mark_fulltext_error(conn, article_id: int) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE processed_articles SET full_text_error = TRUE WHERE id = %s;",
+            (article_id,),
+        )
+
+def mark_domain_fulltext_error(conn, domain: str) -> int:
+    
+    if conn is None or not domain:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE processed_articles
+            SET full_text_error = TRUE
+            WHERE full_text IS NULL
+              AND full_text_error = FALSE
+              AND link LIKE %s
+            """,
+            (f"%{domain}%",),
+        )
+        return cur.rowcount
+
+def mark_article_read(conn, link: str, user_id: int = 0) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO article_reads (link, user_id)
+            VALUES (%s, %s)
+            ON CONFLICT (link, user_id) DO NOTHING;
+            """,
+            (link, user_id),
+        )
+
+def mark_article_unread(conn, link: str, user_id: int = 0) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM article_reads WHERE link = %s AND user_id = %s;",
+            (link, user_id),
+        )
+
+def mark_feed_all_read(conn, feed_id: int, user_id: int = 0) -> int:
+    
+    if conn is None:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO article_reads (link, user_id)
+            SELECT pa.link, %s
+            FROM processed_articles pa
+            WHERE pa.feed_id = %s
+            ON CONFLICT (link, user_id) DO NOTHING;
+            """,
+            (user_id, feed_id),
+        )
+        return cur.rowcount
+
+def get_read_links(conn, links: List[str], user_id: int = 0) -> Set[str]:
+    
+    if conn is None or not links:
+        return set()
+with conn.cursor() as cur:
+        cur.execute(
+            "SELECT link FROM article_reads WHERE link = ANY(%s) AND user_id = %s;",
+            (links, user_id),
+        )
+        return {row["link"] for row in cur.fetchall()}
+
+def list_unread_articles(
+    conn, user_id: int = 0, page: int = 1, page_size: int = 30
+) -> List[dict]:
+    
+    if conn is None:
+        return []
+offset = (page - 1) * page_size
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                FALSE AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            WHERE ar.link IS NULL
+              AND uf.hidden = FALSE
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s OFFSET %s;
+            """,
+            (user_id, user_id, user_id, page_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def list_today_articles(
+    conn, user_id: int = 0
+) -> List[dict]:
+    
+    if conn is None:
+        return []
+with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            WHERE pa.published_at >= CURRENT_DATE
+              AND uf.hidden = FALSE
+            ORDER BY pa.published_at DESC NULLS LAST;
+            """,
+            (user_id, user_id, user_id),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def add_bookmark(conn, link: str, user_id: int = 0) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO article_bookmarks (link, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+            (link, user_id),
+        )
+
+def remove_bookmark(conn, link: str, user_id: int = 0) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM article_bookmarks WHERE link = %s AND user_id = %s;",
+            (link, user_id),
+        )
+
+def list_bookmarks(
+    conn, user_id: int = 0, page: int = 1, page_size: int = 30
+) -> List[dict]:
+    
+    if conn is None:
+        return []
+offset = (page - 1) * page_size
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                (ar.link IS NOT NULL) AS is_read,
+                TRUE AS is_saved,
+                ab.saved_at
+            FROM processed_articles pa
+            JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            ORDER BY ab.saved_at DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (user_id, user_id, page_size, offset),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def get_articles_by_feed_ids(
+    conn,
+    feed_ids: list[int],
+    from_date=None,
+    to_date=None,
+    limit: int = 150,
+    user_id: int = 0,
+) -> list[dict]:
+    
+    if conn is None or not feed_ids:
+        return []
+conditions = ["pa.feed_id = ANY(%s)"]
+    params: list = [feed_ids]
+    if from_date is not None:
+        conditions.append("pa.published_at >= %s")
+        params.append(from_date)
+if to_date is not None:
+        conditions.append("pa.published_at <= %s")
+        params.append(to_date)
+where = " AND ".join(conditions)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT pa.id, pa.link, pa.title, pa.ai_summary, pa.summary,
+                   pa.full_text, pa.published_at, pa.source, pa.feed_id,
+                   rf.name AS feed_name
+            FROM processed_articles pa
+            LEFT JOIN feeds rf ON rf.id = pa.feed_id
+            WHERE {where}
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s;
+            """,
+            params + [limit],
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def search_articles(conn, query: str, user_id: int = 0, limit: int = 20) -> list[dict]:
+    
+    if conn is None:
+        return []
+pattern = f"%{query}%"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.published_at,
+                pa.source,
+                pa.feed_id,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM processed_articles pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            WHERE
+                pa.title ILIKE %s
+                OR pa.ai_summary ILIKE %s
+                OR pa.summary ILIKE %s
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT %s;
+            """,
+            (user_id, user_id, user_id, pattern, pattern, pattern, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def get_articles_for_bertopic_collection(
+    conn,
+    collection_id: int,
+    from_date=None,
+    to_date=None,
+    limit: int = 200,
+    user_id: int = 0,
+) -> List[Dict]:
+    
+    if conn is None:
+        return []
+
+conditions = ["c.id = %s"]
+    params: list = [collection_id]
+
+    if from_date is not None:
+        conditions.append("pa.published_at >= %s")
+        params.append(from_date)
+if to_date is not None:
+        conditions.append("pa.published_at <= %s")
+        params.append(to_date)
+
+where = " AND ".join(conditions)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                pa.id,
+                pa.link,
+                pa.title,
+                pa.summary,
+                pa.ai_summary,
+                pa.source,
+                pa.published_at,
+                pa.feed_id,
+                (ar.link IS NOT NULL) AS is_read,
+                (ab.link IS NOT NULL) AS is_saved
+            FROM {POSTGRES_TABLE_COLLECTIONS} c
+            JOIN {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS} ba ON ba.topic_id = c.bertopic_topic_id AND ba.owner_id = c.owner_id
+            JOIN {POSTGRES_TABLE_PROCESSED_ARTICLES} pa ON pa.link = ba.link
+            LEFT JOIN article_reads ar ON ar.link = pa.link AND ar.user_id = %s
+            LEFT JOIN article_bookmarks ab ON ab.link = pa.link AND ab.user_id = %s
+            WHERE {where}
+            ORDER BY pa.published_at DESC NULLS LAST
+            LIMIT {limit};
+            """,
+            [user_id, user_id] + params,
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def get_bertopic_topics(conn, owner_id: Optional[int] = None) -> List[Dict]:
+    
+    if conn is None:
+        return []
+owner_filter = "AND c.owner_id = %s" if owner_id is not None else ""
+    params = (owner_id,) if owner_id is not None else ()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                c.id,
+                c.name,
+                c.description,
+                c.keywords,
+                c.bertopic_topic_id,
+                c.model_version,
+                c.created_at,
+                COUNT(ba.link) AS article_count
+            FROM {POSTGRES_TABLE_COLLECTIONS} c
+            LEFT JOIN {POSTGRES_TABLE_BERTOPIC_ASSIGNMENTS} ba
+                ON ba.topic_id = c.bertopic_topic_id AND (ba.owner_id = c.owner_id OR ba.owner_id IS NULL)
+            WHERE c.bertopic_topic_id IS NOT NULL {owner_filter}
+            GROUP BY c.id
+            ORDER BY article_count DESC;
+            """,
+            params,
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def create_user(conn, email: str, password_hash: str) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (email, password_hash)
+                VALUES (%s, %s)
+                RETURNING id, email;
+                """,
+                (email, password_hash),
+            )
+            return dict(cur.fetchone())
+except psycopg2.IntegrityError:
+        return None
+
+def get_user_by_email(conn, email: str) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, email, password_hash FROM users WHERE email = %s;",
+            (email,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def get_user_by_id(conn, user_id: int) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, email, password_hash, created_at FROM users WHERE id = %s;",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def update_user_password(conn, user_id: int, new_password_hash: str) -> None:
+    
+    if conn is None:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s;",
+            (new_password_hash, user_id),
+        )
+
+_GLOBAL_RAG_COLLECTION_KEY = "global_rag_index"
+_GLOBAL_RAG_COLLECTION_NAME = "Global RAG Index"
+
+def get_or_create_global_rag_collection(conn) -> Optional[dict]:
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, name, collection_key, owner_id
+            FROM {POSTGRES_TABLE_COLLECTIONS}
+            WHERE collection_key = %s AND name = %s;
+            """,
+            (_GLOBAL_RAG_COLLECTION_KEY, _GLOBAL_RAG_COLLECTION_NAME),
+        )
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+cur.execute(
+            f"""
+            INSERT INTO {POSTGRES_TABLE_COLLECTIONS}
+                (name, collection_key, owner_id, updated_at, last_refreshed_at)
+            VALUES (%s, %s, NULL, NOW(), NOW())
+            RETURNING id, name, collection_key, owner_id;
+            """,
+            (_GLOBAL_RAG_COLLECTION_NAME, _GLOBAL_RAG_COLLECTION_KEY),
+        )
+        row = cur.fetchone()
+return dict(row) if row else None
+
+def get_articles_for_rag_indexing(conn, limit: int = 50) -> list:
+    
+    if conn is None:
+        return []
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, link, title, summary, source, published_at, full_text
+            FROM {POSTGRES_TABLE_PROCESSED_ARTICLES}
+            WHERE (
+                full_text IS NOT NULL
+                OR (full_text_error = TRUE AND summary IS NOT NULL AND summary != '')
+            )
+              AND feed_id IS NOT NULL
+              AND rag_indexed_at IS NULL
+            ORDER BY published_at DESC
+            LIMIT %s;
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def mark_articles_rag_indexed(conn, article_ids: list) -> None:
+    
+    if conn is None or not article_ids:
+        return
+with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {POSTGRES_TABLE_PROCESSED_ARTICLES} SET rag_indexed_at = NOW() WHERE id = ANY(%s);",
+            (article_ids,),
+        )
+
+def get_rag_stats(conn, user_id: int = None) -> dict:
+    
+    if conn is None:
+        return {"indexed": 0, "pending": 0, "total_chunks": 0}
+with conn.cursor() as cur:
+        if user_id is not None:
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE pa.rag_indexed_at IS NOT NULL) AS indexed,
+                    COUNT(*) FILTER (WHERE pa.rag_indexed_at IS NULL) AS pending
+                FROM {POSTGRES_TABLE_PROCESSED_ARTICLES} pa
+                JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+                WHERE NOT (pa.full_text_error = TRUE AND (pa.summary IS NULL OR pa.summary = ''));
+                """,
+                (user_id,),
+            )
+else:
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE rag_indexed_at IS NOT NULL
+                        AND (full_text IS NOT NULL OR (summary IS NOT NULL AND summary != ''))) AS indexed,
+                    COUNT(*) FILTER (WHERE rag_indexed_at IS NULL AND feed_id IS NOT NULL
+                        AND (full_text IS NOT NULL OR (summary IS NOT NULL AND summary != ''))) AS pending
+                FROM {POSTGRES_TABLE_PROCESSED_ARTICLES};
+                """
+            )
+row = cur.fetchone()
+        indexed = int(row["indexed"]) if row else 0
+        pending = int(row["pending"]) if row else 0
+        try:
+            cur.execute(f"SELECT COUNT(*) AS total FROM {POSTGRES_TABLE_RAG_DOCUMENTS};")
+            r2 = cur.fetchone()
+            total_chunks = int(r2["total"]) if r2 else 0
+except Exception:
+            total_chunks = 0
+return {"indexed": indexed, "pending": pending, "total_chunks": total_chunks}
+
+def get_global_rag_collection(conn) -> "Optional[dict]":
+    
+    if conn is None:
+        return None
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, name, collection_key, owner_id
+            FROM {POSTGRES_TABLE_COLLECTIONS}
+            WHERE collection_key = %s AND name = %s;
+            """,
+            (_GLOBAL_RAG_COLLECTION_KEY, _GLOBAL_RAG_COLLECTION_NAME),
+        )
+        row = cur.fetchone()
+return dict(row) if row else None
+
+def get_rag_chunk_count(conn, collection_id: int, feed_ids: list, user_id: int) -> int:
+    
+    if conn is None or not feed_ids:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM {POSTGRES_TABLE_RAG_DOCUMENTS} rd
+            JOIN {POSTGRES_TABLE_PROCESSED_ARTICLES} pa ON pa.link = rd.link
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            WHERE rd.collection_id = %s AND pa.feed_id = ANY(%s);
+            """,
+            (user_id, collection_id, feed_ids),
+        )
+        row = cur.fetchone()
+return int(row["cnt"]) if row else 0
+
+def get_rag_pending_for_collection(conn, collection_id: int) -> int:
+    
+    if conn is None:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM {POSTGRES_TABLE_PROCESSED_ARTICLES} pa
+            JOIN collections c ON c.id = %s
+            JOIN bertopic_assignments ba ON ba.link = pa.link
+                AND ba.topic_id = c.bertopic_topic_id
+                AND ba.owner_id = c.owner_id
+            WHERE (pa.full_text IS NOT NULL OR (pa.summary IS NOT NULL AND pa.summary != ''))
+              AND pa.rag_indexed_at IS NULL;
+            """,
+            (collection_id,),
+        )
+        row = cur.fetchone()
+return int(row["cnt"]) if row else 0
+
+def get_rag_chunk_count_for_collection(conn, rag_collection_id: int, collection_id: int) -> int:
+    
+    if conn is None:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM {POSTGRES_TABLE_RAG_DOCUMENTS} rd
+            JOIN collections c ON c.id = %s
+            JOIN bertopic_assignments ba ON ba.link = rd.link
+                AND ba.topic_id = c.bertopic_topic_id
+                AND ba.owner_id = c.owner_id
+            WHERE rd.collection_id = %s;
+            """,
+            (collection_id, rag_collection_id),
+        )
+        row = cur.fetchone()
+return int(row["cnt"]) if row else 0
+
+def get_rag_coverage_for_collection(conn, rag_collection_id: int, collection_id: int) -> dict:
+    
+    if conn is None:
+        return {"total": 0, "indexed": 0}
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(DISTINCT pa.link) AS total,
+                COUNT(DISTINCT rd.link) AS indexed
+            FROM collections c
+            JOIN bertopic_assignments ba ON ba.topic_id = c.bertopic_topic_id AND ba.owner_id = c.owner_id
+            JOIN {POSTGRES_TABLE_PROCESSED_ARTICLES} pa ON pa.link = ba.link
+            LEFT JOIN {POSTGRES_TABLE_RAG_DOCUMENTS} rd ON rd.link = pa.link AND rd.collection_id = %s
+            WHERE c.id = %s
+              AND (pa.full_text IS NOT NULL OR (pa.summary IS NOT NULL AND pa.summary != ''));
+            """,
+            (rag_collection_id, collection_id),
+        )
+        row = cur.fetchone()
+if row:
+        return {"total": int(row["total"]), "indexed": int(row["indexed"])}
+return {"total": 0, "indexed": 0}
+
+def get_rag_coverage_for_feeds(conn, rag_collection_id: int, feed_ids: list, user_id: int) -> dict:
+    
+    if conn is None or not feed_ids:
+        return {"total": 0, "indexed": 0}
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(DISTINCT pa.link) AS total,
+                COUNT(DISTINCT rd.link) AS indexed
+            FROM {POSTGRES_TABLE_PROCESSED_ARTICLES} pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            LEFT JOIN {POSTGRES_TABLE_RAG_DOCUMENTS} rd ON rd.link = pa.link AND rd.collection_id = %s
+            WHERE pa.feed_id = ANY(%s)
+              AND (pa.full_text IS NOT NULL OR (pa.summary IS NOT NULL AND pa.summary != ''));
+            """,
+            (user_id, rag_collection_id, feed_ids),
+        )
+        row = cur.fetchone()
+if row:
+        return {"total": int(row["total"]), "indexed": int(row["indexed"])}
+return {"total": 0, "indexed": 0}
+
+def get_rag_pending_for_feeds(conn, feed_ids: list, user_id: int) -> int:
+    
+    if conn is None or not feed_ids:
+        return 0
+with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM {POSTGRES_TABLE_PROCESSED_ARTICLES} pa
+            JOIN user_feeds uf ON uf.feed_id = pa.feed_id AND uf.user_id = %s
+            WHERE pa.feed_id = ANY(%s)
+              AND (pa.full_text IS NOT NULL OR (pa.summary IS NOT NULL AND pa.summary != ''))
+              AND pa.rag_indexed_at IS NULL;
+            """,
+            (user_id, feed_ids),
+        )
+        row = cur.fetchone()
+return int(row["cnt"]) if row else 0

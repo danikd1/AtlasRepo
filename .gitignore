@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Результаты работы
+outputs/
+models/
+bertopic_output_2/
+*.xlsx
+*.parquet
+
+# Исключения для конфигурационных файлов
+!data/taxonomy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Node
+node_modules/
+dist/
+.env
+.env.local
+*.log
+
+# Frontend build output
+frontend_dist/
